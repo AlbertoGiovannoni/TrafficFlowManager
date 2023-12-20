@@ -2,22 +2,13 @@ package org.disit.TrafficFlowManager.persistence;
 
 import java.io.IOException;
 import java.net.URLEncoder;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import javax.json.JsonObject;
-
 import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -32,8 +23,6 @@ import org.apache.http.util.EntityUtils;
 import org.disit.TrafficFlowManager.utils.ConfigProperties;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
-import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
@@ -44,16 +33,12 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.disit.TrafficFlowManager.utils.Logger;
 
 public class OpenSearchReconstructionPersistence {
-
-    private static volatile CloseableHttpClient httpClient = HttpClients.createDefault();
-    private static volatile RestClientBuilder builder;
 
     // class to count the number of error occurred in this session
     private static class ErrorCounter {
@@ -68,18 +53,14 @@ public class OpenSearchReconstructionPersistence {
         }
     }
 
-    public static void sendEs(JSONObject dinamico, String kind) throws Exception {
+    public static void sendToEs(JSONObject dinamico, String kind) throws Exception {
 
-        // Path currentRelativePath = Paths.get("");
-        // String path = currentRelativePath.toAbsolutePath().toString();
-        // String filePath = path + "/src/data/conf.json";
         try {
-            // JSONObject conf = new JSONObject(new
-            // String(Files.readAllBytes(Paths.get(filePath))));
+
             Properties conf = ConfigProperties.getProperties();
             String url = conf.getProperty("opensearchHostname");
             if (url == null) {
-                System.out.println("opensearchHostname not specified in configuration NOT SENDING to opensearch");
+                Logger.log("[TFM] opensearchHostname not specified in configuration NOT SENDING to opensearch");
                 return;
             }
             String[] hostnames = url.split(";");
@@ -92,72 +73,68 @@ public class OpenSearchReconstructionPersistence {
             int batchSize = Integer.parseInt(conf.getProperty("opensearchBatchSize", "150"));
             int threadNumber = Integer.parseInt(conf.getProperty("opensearchThreadNumber", "150"));
             int maxErrors = Integer.parseInt(conf.getProperty("opensearchMaxErrors", "20"));
+            int threadNumberPostProcess = Integer.parseInt(conf.getProperty("postProcessThreadNumber", "5"));
 
             String indexName = conf.getProperty("opensearchIndexName", "roadelement2");
 
             // split road elements
 
             // Invio all'indice per segmento
-
-            System.out.println("processing dinamic json");
+            Logger.log("[TFM] processing dinamic json");
             // JSONArray jd20Splitted = new JSONArray(jd20);
 
             JSONArray jd20 = preProcess(dinamico, kind);
 
             JSONArray reArray = new JSONArray();
-            System.out.println("pre-processing JD20");
+            Logger.log("[TFM] pre-processing JD20");
 
             reArray = splitRoadElement(jd20);
 
             Map<String, Double> densityAverageMap = new HashMap<>();
             densityAverageMap = mapDensity(reArray);
 
-            System.out.println("building inverted JD20");
+            Logger.log("[TFM] building inverted JD20");
             JSONArray invertedArray = new JSONArray();
 
             invertedArray = invertedIndex(reArray, densityAverageMap);
+            Logger.log("[TFM] retrieving road element coordinates in KB");
 
-            System.out.println("retrieving road element coordinates in KB");
+            // creo client per le query
+            CloseableHttpClient httpClient = HttpClients.createDefault();
 
-            // int batchSize = conf.getInt("batch_size");// descrive il numero di road
-            // element ricercati in ogni query
-
-            // int threadNumber = conf.getInt("thread_number");
             long start = System.currentTimeMillis();
-
-            // creo un unico httpClient per tutte le richieste
-            // CloseableHttpClient httpClient = HttpClients.createDefault();
-
             JSONObject coord = getCoord(invertedArray, batchSize, kbUrl, httpClient);
-            System.out.println("time retrieving road element coordinates in KB: " + (System.currentTimeMillis() - start)
+            Logger.log("[TFM] time retrieving road element coordinates in KB: " + (System.currentTimeMillis() - start)
                     + " ms");
 
             JSONArray coordArray = coord.getJSONArray("results");
 
-            PostProcessRes result = postProcess(invertedArray, coordArray);
+            System.out.println("lunghezza iniziale: " + invertedArray.length()); // TODO
+
+            PostProcessRes result = postProcess(invertedArray, coordArray, threadNumberPostProcess);
+
+            System.out.println("lunghezza finale: " + result.getPostPorcessData().length()); // TODO
+            System.out.println("ris cumulato: " + result.getPostPorcessData()); // TODO
+
+            System.out.println(
+                    "coordinate estreme: " + result.getMinMaxCoordinates()[0] + " " + result.getMinMaxCoordinates()[1]
+                            + " " + result.getMinMaxCoordinates()[2] + " " + result.getMinMaxCoordinates()[3]); // TODO
+
             invertedArray = result.getPostPorcessData();
-            // invertedArray = postProcess(invertedArray, coordArray);
-
-            // creo indice
-            // createIndex(indexName, url, port, admin, password);
-
-            // gestisco inserimenti con thread
-
-            // create object ErrorCounter
-            // ErrorCounter errorCounter = new ErrorCounter();
 
             // Inizializza l'oggetto ErrorCounter condiviso
             ErrorCounter errorCounter = new ErrorCounter();
 
             System.out.println("indexing documents in elasticSearch");
+            Logger.log("[TFM] indexing documents in elasticsearch");
 
-            System.out.println("errorCounter at the start: " + errorCounter.errorCount);
+            System.out.println("errorCounter at the start: " + errorCounter.errorCount); // TODO
 
             final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
             credentialsProvider.setCredentials(AuthScope.ANY,
                     new UsernamePasswordCredentials(admin, password));
 
-            builder = RestClient.builder(
+            RestClientBuilder builder = RestClient.builder(
                     new HttpHost(url, port, "https"))
                     .setHttpClientConfigCallback(new RestClientBuilder.HttpClientConfigCallback() {
                         @Override
@@ -170,11 +147,11 @@ public class OpenSearchReconstructionPersistence {
 
             sendToIndex(threadNumber, invertedArray, indexName, hostnames, port, admin, password, maxErrors,
                     errorCounter, builder);
-            System.out.println("errorCounter at the end: " + errorCounter.errorCount);
-            System.out.println("done");
+            System.out.println("errorCounter at the end: " + errorCounter.errorCount); // TODO
+            Logger.log("[TFM] done");
 
         } catch (JSONException e) {
-            System.out.println("Error in the main: " + e);
+            Logger.log("[TFM] Error in sendToEs: " + e);
             throw new Exception("Failed to send data to ES: " + e);
         }
     }
@@ -242,7 +219,7 @@ public class OpenSearchReconstructionPersistence {
 
             return JD20;
         } catch (Exception e) {
-            System.out.println("Error processing dinamic json: " + e);
+            Logger.log("[TFM] Error processing dynamic json: " + e);
             throw new Exception("Failed to send data to ES: " + e);
         }
     }
@@ -266,7 +243,7 @@ public class OpenSearchReconstructionPersistence {
             }
             return reArray;
         } catch (Exception e) {
-            System.out.println("Error splitting the dynamic json: " + e);
+            Logger.log("[TFM] Error splitting the dynamic json");
             throw new Exception("Failed to send data to ES: " + e);
         }
     }
@@ -309,7 +286,7 @@ public class OpenSearchReconstructionPersistence {
             }
 
         } catch (Exception e) {
-            System.out.println("Error mapping the density: " + e);
+            Logger.log("[TFM] Error mapping the density: " + e);
             throw new Exception("Failed to send data to ES: " + e);
         }
         ;
@@ -381,7 +358,7 @@ public class OpenSearchReconstructionPersistence {
             }
 
         } catch (Exception e) {
-            System.out.println("Error building the inverted index: " + e);
+            Logger.log("[TFM] Error building the inverted index: " + e);
             throw new Exception("Failed to send data to ES: " + e);
         }
 
@@ -417,109 +394,211 @@ public class OpenSearchReconstructionPersistence {
         }
     }
 
-    private static PostProcessRes postProcess(JSONArray invertedArray, JSONArray coordArray) throws Exception {
-        try {
+    static class PostProcessThread extends Thread {
 
-            // MODIFICA MARCO ////////////////////////
+        private JSONArray partialArray;
+        private JSONArray coordArray;
+        private List<PostProcessRes> totalRes;
+        private PostProcessRes res;
 
-            double minLat = Double.POSITIVE_INFINITY;
-            double minLong = Double.POSITIVE_INFINITY;
-            double maxLat = -1 * Double.POSITIVE_INFINITY;
-            double maxLong = -1 * Double.POSITIVE_INFINITY;
-
-            ////////////////////////////////////////////////////////
-
-            for (int i = 0; i < invertedArray.length(); i++) {
-                String roadelementInverted = invertedArray.getJSONObject(i).getString("roadElements");
-                boolean foundMatch = false;
-
-                // Scorrere il coordArray per cercare una corrispondenza
-                int j = 0;
-
-                while (!foundMatch && j < coordArray.length()) {
-                    String roadelementCoord = coordArray.getJSONObject(j).getJSONObject("id").getString("value");
-
-                    if (roadelementInverted.equals(roadelementCoord)) {
-                        foundMatch = true;
-                    } else {
-                        j++; // Incrementa j per passare all'elemento successivo in coordArray
-                    }
-                }
-
-                if (!foundMatch) {
-                    // System.out.println("Il road element: " +
-                    // invertedArray.getJSONObject(i).getString("roadElements")
-                    // + " non ha trovato corrispondenza in KB!!");
-                    invertedArray.remove(i);
-                    i--; // Decrementa l'indice per continuare la verifica con il nuovo elemento in
-
-                    // questa posizione
-                } else {
-
-                    String slong = coordArray.getJSONObject(j).getJSONObject("slong").getString("value");
-                    String slat = coordArray.getJSONObject(j).getJSONObject("slat").getString("value");
-                    String elong = coordArray.getJSONObject(j).getJSONObject("elong").getString("value");
-                    String elat = coordArray.getJSONObject(j).getJSONObject("elat").getString("value");
-
-                    // MODIFICA MARCO ///////////////////////////////////////
-                    double slatDouble = Double.valueOf(slat);
-                    double slongDouble = Double.valueOf(slong);
-                    double elatDouble = Double.valueOf(elat);
-                    double elongDouble = Double.valueOf(elong);
-
-                    if (slatDouble < minLat) {
-                        minLat = slatDouble;
-                    }
-                    if (slatDouble > maxLat) {
-                        maxLat = slatDouble;
-                    }
-                    if (slongDouble < minLong) {
-                        minLong = slongDouble;
-                    }
-                    if (slongDouble > maxLong) {
-                        maxLong = slongDouble;
-                    }
-
-                    if (elatDouble < minLat) {
-                        minLat = elatDouble;
-                    }
-                    if (elatDouble > maxLat) {
-                        maxLat = elatDouble;
-                    }
-                    if (elongDouble < minLong) {
-                        minLong = elongDouble;
-                    }
-                    if (elongDouble > maxLong) {
-                        maxLong = elongDouble;
-                    }
-
-                    ////////////////////////////////////////////////////////
-
-                    invertedArray.getJSONObject(i).getJSONObject("start").getJSONObject("location").put("lon", slong);
-
-                    invertedArray.getJSONObject(i).getJSONObject("start").getJSONObject("location").put("lat", slat);
-
-                    invertedArray.getJSONObject(i).getJSONObject("end").getJSONObject("location").put("lon", elong);
-
-                    invertedArray.getJSONObject(i).getJSONObject("end").getJSONObject("location").put("lat", elat);
-
-                    String lineString = "{\"type\": \"LineString\",\"coordinates\": [[" + slong + ", " + slat + "], ["
-                            + elong + ", " + elat + "]]}";
-
-                    JSONObject line = new JSONObject(lineString);
-
-                    invertedArray.getJSONObject(i).put("line", line);
-
-                }
-
-            }
-            PostProcessRes res = new PostProcessRes(invertedArray, minLat, maxLat, minLong, maxLong);
-            return res;
-        } catch (Exception e) {
-            System.out.println("Error in post processing: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+        public PostProcessThread(JSONArray partialArray, JSONArray coordArray, List<PostProcessRes> totalRes) {
+            this.partialArray = partialArray;
+            this.coordArray = coordArray;
+            this.totalRes = totalRes;
         }
-        // return invertedArray;
+
+        @Override
+        public void run() {
+            try {
+
+                // MODIFICA MARCO ////////////////////////
+
+                double minLat = Double.POSITIVE_INFINITY;
+                double minLong = Double.POSITIVE_INFINITY;
+                double maxLat = -1 * Double.POSITIVE_INFINITY;
+                double maxLong = -1 * Double.POSITIVE_INFINITY;
+
+                ////////////////////////////////////////////////////////
+
+                for (int i = 0; i < partialArray.length(); i++) {
+                    String roadelementInverted = partialArray.getJSONObject(i).getString("roadElements");
+                    boolean foundMatch = false;
+
+                    // Scorrere il coordArray per cercare una corrispondenza
+                    int j = 0;
+
+                    while (!foundMatch && j < coordArray.length()) {
+                        String roadelementCoord = coordArray.getJSONObject(j).getJSONObject("id").getString("value");
+
+                        if (roadelementInverted.equals(roadelementCoord)) {
+                            foundMatch = true;
+                        } else {
+                            j++; // Incrementa j per passare all'elemento successivo in coordArray
+                        }
+                    }
+
+                    if (!foundMatch) {
+                        // System.out.println("Il road element: " +
+                        // invertedArray.getJSONObject(i).getString("roadElements")
+                        // + " non ha trovato corrispondenza in KB!!");
+                        partialArray.remove(i);
+                        i--; // Decrementa l'indice per continuare la verifica con il nuovo elemento in
+
+                        // questa posizione
+                    } else {
+
+                        String slong = coordArray.getJSONObject(j).getJSONObject("slong").getString("value");
+                        String slat = coordArray.getJSONObject(j).getJSONObject("slat").getString("value");
+                        String elong = coordArray.getJSONObject(j).getJSONObject("elong").getString("value");
+                        String elat = coordArray.getJSONObject(j).getJSONObject("elat").getString("value");
+
+                        // MODIFICA MARCO ///////////////////////////////////////
+                        double slatDouble = Double.valueOf(slat);
+                        double slongDouble = Double.valueOf(slong);
+                        double elatDouble = Double.valueOf(elat);
+                        double elongDouble = Double.valueOf(elong);
+
+                        if (slatDouble < minLat) {
+                            minLat = slatDouble;
+                        }
+                        if (slatDouble > maxLat) {
+                            maxLat = slatDouble;
+                        }
+                        if (slongDouble < minLong) {
+                            minLong = slongDouble;
+                        }
+                        if (slongDouble > maxLong) {
+                            maxLong = slongDouble;
+                        }
+
+                        if (elatDouble < minLat) {
+                            minLat = elatDouble;
+                        }
+                        if (elatDouble > maxLat) {
+                            maxLat = elatDouble;
+                        }
+                        if (elongDouble < minLong) {
+                            minLong = elongDouble;
+                        }
+                        if (elongDouble > maxLong) {
+                            maxLong = elongDouble;
+                        }
+
+                        ////////////////////////////////////////////////////////
+
+                        partialArray.getJSONObject(i).getJSONObject("start").getJSONObject("location").put("lon",
+                                slong);
+
+                        partialArray.getJSONObject(i).getJSONObject("start").getJSONObject("location").put("lat", slat);
+
+                        partialArray.getJSONObject(i).getJSONObject("end").getJSONObject("location").put("lon", elong);
+
+                        partialArray.getJSONObject(i).getJSONObject("end").getJSONObject("location").put("lat", elat);
+
+                        String lineString = "{\"type\": \"LineString\",\"coordinates\": [[" + slong + ", " + slat
+                                + "], ["
+                                + elong + ", " + elat + "]]}";
+
+                        JSONObject line = new JSONObject(lineString);
+
+                        partialArray.getJSONObject(i).put("line", line);
+
+                    }
+
+                }
+                res = new PostProcessRes(partialArray, minLat, maxLat, minLong, maxLong);
+            } catch (Exception e) {
+                Logger.log("[TFM] Error in post processing: " + e);
+            }
+            synchronized (totalRes) {
+                totalRes.add(res);
+            }
+        }
+    }
+
+    private static PostProcessRes postProcess(JSONArray invertedArray, JSONArray coordArray, int threadNumber)
+            throws Exception {
+
+        // suddivido invertedArray in parti uguali da dare ai thread
+        int arrayLen = invertedArray.length();
+
+        // Calcola la dimensione esatta di ogni parte
+        int dimensioneParte = (int) Math.ceil((double) arrayLen / threadNumber);
+
+        // Inizializza un array di JSONArray per contenere le parti
+        JSONArray[] partsArray = new JSONArray[threadNumber];
+
+        // Suddividi il JSONArray in n parti
+        for (int i = 0; i < threadNumber; i++) {
+            int inizio = i * dimensioneParte;
+            int fine = Math.min((i + 1) * dimensioneParte, arrayLen);
+
+            // Estrai la parte corrente direttamente nella logica
+            JSONArray parteCorrente = new JSONArray();
+            for (int j = inizio; j < fine; j++) {
+                parteCorrente.put(invertedArray.get(j));
+            }
+
+            // Assegna la parte all'array di parti
+            partsArray[i] = parteCorrente;
+        }
+
+        List<Thread> threads = new ArrayList<>();
+        List<PostProcessRes> totalRes = new ArrayList<>();
+
+        for (int i = 0; i < threadNumber; i++) {
+            Thread PostprocessThread = new PostProcessThread(partsArray[i], coordArray, totalRes);
+            threads.add(PostprocessThread);
+            PostprocessThread.start();
+        }
+
+        // Attendere il completamento di tutti i thread
+        for (Thread thread : threads) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
+        PostProcessRes res;
+        JSONArray tmp = new JSONArray();
+        double minLat = Double.POSITIVE_INFINITY;
+        double minLong = Double.POSITIVE_INFINITY;
+        double maxLat = -1 * Double.POSITIVE_INFINITY;
+        double maxLong = -1 * Double.POSITIVE_INFINITY;
+
+        double coord[] = new double[4];
+
+        // unisco i risultati
+        for (int j = 0; j < totalRes.size(); j++) {
+            // tmp.put(totalRes.get(j).getPostPorcessData());
+            JSONArray dataTmp = totalRes.get(j).getPostPorcessData();
+            for (int k = 0; k < dataTmp.length(); k++) {
+                tmp.put(dataTmp.getJSONObject(k));
+            }
+
+            coord = totalRes.get(j).getMinMaxCoordinates();
+
+            if (coord[0] < minLat) {
+                minLat = coord[0];
+            }
+
+            if (coord[2] < minLong) {
+                minLong = coord[2];
+            }
+
+            if (coord[1] > maxLat) {
+                maxLat = coord[1];
+            }
+
+            if (coord[3] > maxLong) {
+                maxLong = coord[3];
+            }
+        }
+        res = new PostProcessRes(tmp, minLat, maxLat, minLong, maxLong);
+
+        return res;
     }
     // ############################################# QUERY METHODS
 
@@ -553,7 +632,7 @@ public class OpenSearchReconstructionPersistence {
                     HttpGet httpGet = new HttpGet(sparqlEndpoint + "&query=" + encodedQuery);
                     try (CloseableHttpResponse response = httpClient.execute(httpGet)) {
                         if (response.getStatusLine().getStatusCode() != 200) {
-                            System.out.println("Error: " + response);
+                            Logger.log("[TFM] Error KBthread: " + response);
                         }
                         ;
                         String resp = EntityUtils.toString(response.getEntity());
@@ -561,10 +640,8 @@ public class OpenSearchReconstructionPersistence {
                         resultsArray = jsonResp.getJSONObject("results").getJSONArray("bindings");
                     }
 
-                    // System.out.println("risultato thread " + resultsArray);
                 } catch (Exception e) {
-                    System.out.println("Error retrieving road element coordinates in KB, thread"
-                            + index + ": " + e);
+                    Logger.log("[TFM] Error retrieving road element coordinates in KB: " + e);
                     errorFlag = true;
                     errorMessage = e.getMessage();
                 }
@@ -586,6 +663,7 @@ public class OpenSearchReconstructionPersistence {
         public static String errorMessage() {
             return errorMessage;
         }
+
     }
 
     private static JSONObject getCoord(JSONArray invertedArray, int batchSize, String kbUrl,
@@ -660,7 +738,6 @@ public class OpenSearchReconstructionPersistence {
                     e.printStackTrace();
                 }
             }
-            System.out.println("In KB, has error occurred: " + KBThread.hasErrorOccurred());
 
             if (KBThread.hasErrorOccurred()) {
                 throw new Exception("Failed to send data to ES: " + KBThread.errorMessage());
@@ -670,7 +747,7 @@ public class OpenSearchReconstructionPersistence {
             totalJsonResp.put("results", allResults);
 
         } catch (Exception e) {
-            System.out.println(e);
+            Logger.log("[TFM] Error in getCoord: " + e);
             throw new Exception("Failed to send data to ES: " + KBThread.errorMessage());
         }
         return totalJsonResp;
@@ -707,12 +784,12 @@ public class OpenSearchReconstructionPersistence {
                         builder);
 
                 if (!status) {
-                    System.out.println("Failed to send data to ES: too many errors indexing data");
+                    Logger.log("[TFM] Failed to send data to ES, too many errors indexing data");
                     throw new Exception("Failed to send data to ES");
                 }
 
             } catch (Exception e) {
-                System.out.println("Error indexing document in Es, thread" + index + ": " + e);
+                Logger.log("[TFM] Error indexing document in ES: " + e);
                 errorFlag = true;
                 errorMessage = e.getMessage();
             }
@@ -771,7 +848,7 @@ public class OpenSearchReconstructionPersistence {
                 throw new Exception("Failed to send data to ES: " + ESThread.errorMessage());
             }
         } catch (Exception e) {
-            System.out.println("Error sending data to ES: " + e.getMessage());
+            Logger.log("[TFM] Error sending document to ES: " + e);
             throw new Exception("Failed to send data to ES: " + ESThread.errorMessage());
         }
 
@@ -804,22 +881,23 @@ public class OpenSearchReconstructionPersistence {
                 System.err.println("Error indexing document: " + e);
                 Thread.sleep(500);
                 errorCounter.incrementErrorCount();
-                System.out.println(errorCounter.getErrorCount());
-                System.out.println("Retrying for the current document");
+
+                Logger.log("[TFM] Retrying the current document");
                 // Riprova solo per l'elemento corrente
                 try {
                     IndexRequest retryRequest = new IndexRequest(indexName).source(jsonDocument,
                             XContentType.JSON);
                     client.index(retryRequest, RequestOptions.DEFAULT);
                     nSent++;
-                    System.out.println("New indexing attempt successful");
+
+                    Logger.log("[TFM] New indexing attempt successful");
                 } catch (Exception ex) {
-                    System.err.println("Error twice indexing document the document has not been indexed: " + ex);
+                    Logger.log("[TFM] Error twice indexing the document, the document has not been indexed: " + ex);
                 }
             }
         }
         client.close();
-        System.out.println(Thread.currentThread().getName() + " sent:" + nSent + " hostname:" + url);
+        Logger.log("[TFM] " + Thread.currentThread().getName() + " sent:" + nSent + " hostname:" + url);
         if (errorCounter.getErrorCount() < maxErrors) {
             return true;
         } else {

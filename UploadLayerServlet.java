@@ -101,7 +101,7 @@ public class UploadLayerServlet extends HttpServlet {
                     String uploadedLayerName = handleReconstruction(body);
                     JSONObject jbody = new JSONObject(body.toString());
                     if (conf.getProperty("saveToES", "onrequest").equals("always") || jbody.has("saveToES")) {
-                        OpenSearchReconstructionPersistence.sendEs(jbody, "reconstructed");
+                        OpenSearchReconstructionPersistence.sendToEs(jbody, "reconstructed");
                     } else {
                         System.out.println("SKIP save on elastic search");
                     }
