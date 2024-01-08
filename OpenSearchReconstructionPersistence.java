@@ -41,8 +41,10 @@ import org.disit.TrafficFlowManager.utils.Logger;
 public class OpenSearchReconstructionPersistence {
 
     // class to count the number of error occurred in this session
-    private static class ErrorCounter {
+    private static class ErrorManager {
         private int errorCount = 0;
+        boolean mustStop = false;
+        String errorMessage;
 
         public synchronized void incrementErrorCount() {
             errorCount++;
@@ -50,6 +52,22 @@ public class OpenSearchReconstructionPersistence {
 
         public int getErrorCount() {
             return errorCount;
+        }
+
+        public void setMustStop() {
+            mustStop = true;
+        }
+
+        public boolean getMustStop() {
+            return mustStop;
+        }
+
+        public void writeError(String errorMess) {
+            errorMessage = errorMess;
+        }
+
+        public String getErrorMessage() {
+            return errorMessage;
         }
     }
 
@@ -78,10 +96,7 @@ public class OpenSearchReconstructionPersistence {
             String indexName = conf.getProperty("opensearchIndexName", "roadelement2");
 
             // split road elements
-
-            // Invio all'indice per segmento
             Logger.log("[TFM] processing dinamic json");
-            // JSONArray jd20Splitted = new JSONArray(jd20);
 
             JSONArray jd20 = preProcess(dinamico, kind);
 
@@ -90,45 +105,38 @@ public class OpenSearchReconstructionPersistence {
 
             reArray = splitRoadElement(jd20);
 
+            // calcolo densità media per roadelement
             Map<String, Double> densityAverageMap = new HashMap<>();
             densityAverageMap = mapDensity(reArray);
 
             Logger.log("[TFM] building inverted JD20");
             JSONArray invertedArray = new JSONArray();
 
+            // inversione indice
             invertedArray = invertedIndex(reArray, densityAverageMap);
+
             Logger.log("[TFM] retrieving road element coordinates in KB");
 
             // creo client per le query
             CloseableHttpClient httpClient = HttpClients.createDefault();
 
+            // Inizializza l'oggetto errorManager condiviso
+            ErrorManager errorManager = new ErrorManager();
+
+            // recupero coordinate roadelement in KB
             long start = System.currentTimeMillis();
-            JSONObject coord = getCoord(invertedArray, batchSize, kbUrl, httpClient);
+            JSONObject coord = getCoord(invertedArray, batchSize, kbUrl, httpClient, errorManager);
             Logger.log("[TFM] time retrieving road element coordinates in KB: " + (System.currentTimeMillis() - start)
                     + " ms");
 
             JSONArray coordArray = coord.getJSONArray("results");
 
-            System.out.println("lunghezza iniziale: " + invertedArray.length()); // TODO
-
             PostProcessRes result = postProcess(invertedArray, coordArray, threadNumberPostProcess);
-
-            System.out.println("lunghezza finale: " + result.getPostPorcessData().length()); // TODO
-            System.out.println("ris cumulato: " + result.getPostPorcessData()); // TODO
-
-            System.out.println(
-                    "coordinate estreme: " + result.getMinMaxCoordinates()[0] + " " + result.getMinMaxCoordinates()[1]
-                            + " " + result.getMinMaxCoordinates()[2] + " " + result.getMinMaxCoordinates()[3]); // TODO
 
             invertedArray = result.getPostPorcessData();
 
-            // Inizializza l'oggetto ErrorCounter condiviso
-            ErrorCounter errorCounter = new ErrorCounter();
-
             System.out.println("indexing documents in elasticSearch");
             Logger.log("[TFM] indexing documents in elasticsearch");
-
-            System.out.println("errorCounter at the start: " + errorCounter.errorCount); // TODO
 
             final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
             credentialsProvider.setCredentials(AuthScope.ANY,
@@ -145,14 +153,14 @@ public class OpenSearchReconstructionPersistence {
                         }
                     });
 
+            // invio documenti in elasticsearch
             sendToIndex(threadNumber, invertedArray, indexName, hostnames, port, admin, password, maxErrors,
-                    errorCounter, builder);
-            System.out.println("errorCounter at the end: " + errorCounter.errorCount); // TODO
+                    errorManager, builder);
             Logger.log("[TFM] done");
 
         } catch (JSONException e) {
             Logger.log("[TFM] Error in sendToEs: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
         }
     }
     // ############################################# PROCESSING METHODS
@@ -197,7 +205,7 @@ public class OpenSearchReconstructionPersistence {
 
                         for (int i = 0; i < roadElements.length; i++) {
                             roadElements[i] = roadElements[i] + "_" + dir; // serve per distinguere i roadelemet
-                                                                           // percosrsi in senso invertito
+                                                                           // percorsi in senso invertito
 
                             if (i == roadElements.length - 1) {
                                 // Dividi l'ultimo road element quando trovi "."
@@ -220,7 +228,7 @@ public class OpenSearchReconstructionPersistence {
             return JD20;
         } catch (Exception e) {
             Logger.log("[TFM] Error processing dynamic json: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
         }
     }
 
@@ -244,7 +252,7 @@ public class OpenSearchReconstructionPersistence {
             return reArray;
         } catch (Exception e) {
             Logger.log("[TFM] Error splitting the dynamic json");
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
         }
     }
 
@@ -287,7 +295,7 @@ public class OpenSearchReconstructionPersistence {
 
         } catch (Exception e) {
             Logger.log("[TFM] Error mapping the density: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
         }
         ;
 
@@ -359,12 +367,13 @@ public class OpenSearchReconstructionPersistence {
 
         } catch (Exception e) {
             Logger.log("[TFM] Error building the inverted index: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
         }
 
         return invertedArray;
     }
 
+    // oggetti risultato del post process
     private static class PostProcessRes {
         private JSONArray data;
         private double minlat;
@@ -611,63 +620,54 @@ public class OpenSearchReconstructionPersistence {
         private int index;
         private static boolean errorFlag = false;
         private static String errorMessage;
+        private ErrorManager errorManager;
 
         public KBThread(int index, String query, String sparqlEndpoint, JSONArray allResults,
-                CloseableHttpClient httpClient) {
+                CloseableHttpClient httpClient, ErrorManager errorManager) {
             this.query = query;
             this.allResults = allResults;
             this.sparqlEndpoint = sparqlEndpoint;
             this.httpClient = httpClient;
             this.index = index;
+            this.errorManager = errorManager;
         }
 
         @Override
         public void run() {
+
+            String encodedQuery;
+            JSONArray resultsArray = null;
             try {
-
-                String encodedQuery;
-                JSONArray resultsArray = null;
-                try {
-                    encodedQuery = URLEncoder.encode(query, "UTF-8");
-                    HttpGet httpGet = new HttpGet(sparqlEndpoint + "&query=" + encodedQuery);
-                    try (CloseableHttpResponse response = httpClient.execute(httpGet)) {
-                        if (response.getStatusLine().getStatusCode() != 200) {
-                            Logger.log("[TFM] Error KBthread: " + response);
-                        }
-                        ;
-                        String resp = EntityUtils.toString(response.getEntity());
-                        JSONObject jsonResp = new JSONObject(resp);
-                        resultsArray = jsonResp.getJSONObject("results").getJSONArray("bindings");
+                encodedQuery = URLEncoder.encode(query, "UTF-8");
+                HttpGet httpGet = new HttpGet(sparqlEndpoint + "&query=" + encodedQuery);
+                try (CloseableHttpResponse response = httpClient.execute(httpGet)) {
+                    if (response.getStatusLine().getStatusCode() != 200) {
+                        Logger.log("[TFM] Error KBthread: " + response);
                     }
-
-                } catch (Exception e) {
-                    Logger.log("[TFM] Error retrieving road element coordinates in KB: " + e);
-                    errorFlag = true;
-                    errorMessage = e.getMessage();
-                }
-                synchronized (allResults) {
-                    // System.out.println("thread" + index + " " + resultsArray.get(0));
-                    for (int i = 0; i < resultsArray.length(); i++) {
-                        allResults.put(resultsArray.getJSONObject(i));
-                    }
+                    ;
+                    String resp = EntityUtils.toString(response.getEntity());
+                    JSONObject jsonResp = new JSONObject(resp);
+                    resultsArray = jsonResp.getJSONObject("results").getJSONArray("bindings");
                 }
 
-            } catch (Exception ex) {
+            } catch (Exception e) {
+                Logger.log("[TFM] Error retrieving road element coordinates in KB: " + e);
+
+                errorManager.setMustStop();
+                errorManager.writeError(e.getMessage());
             }
-        }
+            synchronized (allResults) {
+                // System.out.println("thread" + index + " " + resultsArray.get(0));
+                for (int i = 0; i < resultsArray.length(); i++) {
+                    allResults.put(resultsArray.getJSONObject(i));
+                }
+            }
 
-        public static boolean hasErrorOccurred() {
-            return errorFlag;
         }
-
-        public static String errorMessage() {
-            return errorMessage;
-        }
-
     }
 
     private static JSONObject getCoord(JSONArray invertedArray, int batchSize, String kbUrl,
-            CloseableHttpClient httpClient) throws Exception {
+            CloseableHttpClient httpClient, ErrorManager errorManager) throws Exception {
 
         JSONObject totalJsonResp = new JSONObject(); // Oggetto JSON che conterrà tutti i risultati
 
@@ -724,7 +724,7 @@ public class OpenSearchReconstructionPersistence {
             int index = 0;
 
             for (String query : queryList) {
-                Thread KBThread = new KBThread(index, query, sparqlEndpoint, allResults, httpClient);
+                Thread KBThread = new KBThread(index, query, sparqlEndpoint, allResults, httpClient, errorManager);
                 index++;
                 threads.add(KBThread);
                 KBThread.start();
@@ -739,8 +739,8 @@ public class OpenSearchReconstructionPersistence {
                 }
             }
 
-            if (KBThread.hasErrorOccurred()) {
-                throw new Exception("Failed to send data to ES: " + KBThread.errorMessage());
+            if (errorManager.getMustStop()) {
+                throw new Exception("[TFM] Failed to retrive coordinates from KB: " + errorManager.getErrorMessage());
             }
 
             // Aggiungi l'array di tutti i risultati all'oggetto JSON di risposta
@@ -748,7 +748,7 @@ public class OpenSearchReconstructionPersistence {
 
         } catch (Exception e) {
             Logger.log("[TFM] Error in getCoord: " + e);
-            throw new Exception("Failed to send data to ES: " + KBThread.errorMessage());
+            throw new Exception("[TFM] Failed to retrive coordinates from KB: " + errorManager.getErrorMessage());
         }
         return totalJsonResp;
     }
@@ -759,20 +759,18 @@ public class OpenSearchReconstructionPersistence {
         private JSONArray documents;
         private String indexName;
         private String url;
-        private static boolean errorFlag = false;
-        private static String errorMessage;
         private int maxErrors;
-        private ErrorCounter errorCounter;
+        private ErrorManager errorManager;
         private RestClientBuilder builder;
 
         public ESThread(int index, String indexName, JSONArray documents, String url, int maxErrors,
-                ErrorCounter errorCounter, RestClientBuilder builder) {
+                ErrorManager errorManager, RestClientBuilder builder) {
             this.index = index;
             this.documents = documents;
             this.indexName = indexName;
             this.url = url;
             this.maxErrors = maxErrors;
-            this.errorCounter = errorCounter;
+            this.errorManager = errorManager;
             this.builder = builder;
         }
 
@@ -780,57 +778,49 @@ public class OpenSearchReconstructionPersistence {
         public void run() {
             try {
 
-                boolean status = sendDoc(indexName, documents, url, maxErrors, errorCounter,
+                boolean status = sendDoc(indexName, documents, url, maxErrors, errorManager,
                         builder);
 
                 if (!status) {
                     Logger.log("[TFM] Failed to send data to ES, too many errors indexing data");
-                    throw new Exception("Failed to send data to ES");
+                    throw new Exception("[TFM] Max number of errors exceeded");
                 }
 
             } catch (Exception e) {
-                Logger.log("[TFM] Error indexing document in ES: " + e);
-                errorFlag = true;
-                errorMessage = e.getMessage();
+
+                errorManager.setMustStop();
+                errorManager.writeError(e.getMessage());
+
             }
-        }
-
-        public static boolean hasErrorOccurred() {
-            return errorFlag;
-        }
-
-        public static String errorMessage() {
-            return errorMessage;
         }
     }
 
     private static void sendToIndex(int threadNumber, JSONArray invertedArray, String indexName, String[] url, int port,
-            String admin, String password, int maxErrors, ErrorCounter errorCounter, RestClientBuilder builder)
+            String admin, String password, int maxErrors, ErrorManager errorManager, RestClientBuilder builder)
             throws Exception {
 
         try {
             int length = invertedArray.length();
-            int numParts = Math.min(threadNumber, length); // Ensure that the number of parts is not greater than the
-                                                           // length of the array
-            int chunkSize = (int) Math.ceil((double) length / numParts); // Calculate the size of each chunk, rounding
-                                                                         // up to handle any remainder
-            JSONArray[] dividedArrays = new JSONArray[numParts]; // Create an array of JSONArray
+            int numParts = Math.min(threadNumber, length); // si assicura che il numero di parti non superi la lunghezza
+                                                           // dell'array
+            int chunkSize = (int) Math.ceil((double) length / numParts); // Calcola la dimensione di ciascun chunk
+            JSONArray[] dividedArrays = new JSONArray[numParts];
 
             for (int i = 0; i < numParts; i++) {
-                dividedArrays[i] = new JSONArray(); // Create a new JSONArray for each part
+                dividedArrays[i] = new JSONArray(); // Crea un nuovo JSONArray per ogni parte
             }
 
             for (int i = 0; i < length; i++) {
-                int chunkIndex = Math.min(i / chunkSize, numParts - 1); // Calculate the index of the part to which to
-                                                                        // add the element
-                dividedArrays[chunkIndex].put(invertedArray.get(i)); // Add the element to the corresponding JSONArray
+                int chunkIndex = Math.min(i / chunkSize, numParts - 1); // Calcola l'indice della parte in cui
+                                                                        // aggiungere l'elemento
+                dividedArrays[chunkIndex].put(invertedArray.get(i));
             }
 
             List<Thread> threads = new ArrayList<>();
 
             for (int i = 0; i < numParts; i++) {
                 Thread ESThread = new ESThread(i, indexName, dividedArrays[i], url[i % url.length], maxErrors,
-                        errorCounter, builder);
+                        errorManager, builder);
                 threads.add(ESThread);
                 ESThread.start();
             }
@@ -844,18 +834,19 @@ public class OpenSearchReconstructionPersistence {
                 }
             }
 
-            if (ESThread.hasErrorOccurred()) {
-                throw new Exception("Failed to send data to ES: " + ESThread.errorMessage());
+            if (errorManager.getMustStop()) {
+                throw new Exception("[TFM] Failed to send data to ES: " + errorManager.getErrorMessage());
             }
+
         } catch (Exception e) {
             Logger.log("[TFM] Error sending document to ES: " + e);
-            throw new Exception("Failed to send data to ES: " + ESThread.errorMessage());
+            throw new Exception("[TFM] Failed to send data to ES: " + errorManager.getErrorMessage());
         }
 
     }
 
     private static boolean sendDoc(String indexName, JSONArray jsonArray, String url, int maxErrors,
-            ErrorCounter errorCounter, RestClientBuilder builder)
+            ErrorManager errorManager, RestClientBuilder builder)
             throws Exception {
 
         RestHighLevelClient client = new RestHighLevelClient(builder);
@@ -867,20 +858,19 @@ public class OpenSearchReconstructionPersistence {
         IndexResponse response = null;
 
         // Invia il documento JSON a Elasticsearch per l'indicizzazione
-
         for (int i = 0; i < jsonArray.length(); i++) {
             jsonDocument = jsonArray.getJSONObject(i).toString();
             try {
-                if (errorCounter.getErrorCount() < maxErrors) {
+                if (errorManager.getErrorCount() < maxErrors) {
                     IndexRequest request = new IndexRequest(indexName).source(jsonDocument,
                             XContentType.JSON);
                     client.index(request, RequestOptions.DEFAULT);
                     nSent++;
                 }
             } catch (Exception e) {
-                System.err.println("Error indexing document: " + e);
+                Logger.log("[TFM] Error indexing document: " + e);
                 Thread.sleep(500);
-                errorCounter.incrementErrorCount();
+                errorManager.incrementErrorCount();
 
                 Logger.log("[TFM] Retrying the current document");
                 // Riprova solo per l'elemento corrente
@@ -898,7 +888,7 @@ public class OpenSearchReconstructionPersistence {
         }
         client.close();
         Logger.log("[TFM] " + Thread.currentThread().getName() + " sent:" + nSent + " hostname:" + url);
-        if (errorCounter.getErrorCount() < maxErrors) {
+        if (errorManager.getErrorCount() < maxErrors) {
             return true;
         } else {
             return false;
@@ -907,6 +897,8 @@ public class OpenSearchReconstructionPersistence {
     }
 
     // #################################### INDEX CREATION
+
+    // FUNZIONI UTILI PER LA CREAZIONE DI INDICE ELASTICSEARCH
 
     private static void createIndex(String indexName, String url, int port, String admin, String password)
             throws Exception {
@@ -953,7 +945,7 @@ public class OpenSearchReconstructionPersistence {
 
         } catch (Exception e) {
             System.out.println("Eccezione nella creazione dell'indice: " + e);
-            throw new Exception("Failed to send data to ES: " + e);
+            throw new Exception("[TFM] Failed to send data to ES: " + e);
 
         }
     }
