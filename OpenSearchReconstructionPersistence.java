@@ -2,6 +2,8 @@ package org.disit.TrafficFlowManager.persistence;
 
 import java.io.IOException;
 import java.net.URLEncoder;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -22,7 +24,6 @@ import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
 import org.apache.http.util.EntityUtils;
 import org.disit.TrafficFlowManager.utils.ConfigProperties;
 import org.elasticsearch.action.index.IndexRequest;
-import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
@@ -37,6 +38,9 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.disit.TrafficFlowManager.utils.Logger;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
 
 public class OpenSearchReconstructionPersistence {
 
@@ -71,7 +75,7 @@ public class OpenSearchReconstructionPersistence {
         }
     }
 
-    public static void sendToEs(JSONObject dinamico, String kind) throws Exception {
+    public static int[] sendToEs(JSONObject dinamico, String kind) throws Exception {
 
         try {
 
@@ -79,7 +83,7 @@ public class OpenSearchReconstructionPersistence {
             String url = conf.getProperty("opensearchHostname");
             if (url == null) {
                 Logger.log("[TFM] opensearchHostname not specified in configuration NOT SENDING to opensearch");
-                return;
+                return null;
             }
             String[] hostnames = url.split(";");
             int port = 9200;
@@ -90,10 +94,16 @@ public class OpenSearchReconstructionPersistence {
 
             int batchSize = Integer.parseInt(conf.getProperty("opensearchBatchSize", "150"));
             int threadNumber = Integer.parseInt(conf.getProperty("opensearchThreadNumber", "150"));
-            int maxErrors = Integer.parseInt(conf.getProperty("opensearchMaxErrors", "20"));
+            int maxErrors = Integer.parseInt(conf.getProperty("opensearchMaxErrors", "200"));
             int threadNumberPostProcess = Integer.parseInt(conf.getProperty("postProcessThreadNumber", "5"));
 
-            String indexName = conf.getProperty("opensearchIndexName", "roadelement2");
+            String indexName = conf.getProperty("opensearchIndexName", "roadelement4");
+
+            LocalDate date = LocalDate.now();
+            String failDir = conf.getProperty("failFolderTFM") + "/" + date;
+
+            Path failureFolderPath = Paths.get(failDir);
+            Files.createDirectories(failureFolderPath);
 
             // split road elements
             Logger.log("[TFM] processing dinamic json");
@@ -131,32 +141,46 @@ public class OpenSearchReconstructionPersistence {
 
             JSONArray coordArray = coord.getJSONArray("results");
 
+            start = System.currentTimeMillis();
             PostProcessRes result = postProcess(invertedArray, coordArray, threadNumberPostProcess);
+            Logger.log("[TFM] time post processing: " + (System.currentTimeMillis() - start)
+                    + " ms");
 
             invertedArray = result.getPostPorcessData();
 
-            System.out.println("indexing documents in elasticSearch");
+            // System.out.println("indexing documents in elasticSearch");
             Logger.log("[TFM] indexing documents in elasticsearch");
 
             final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
             credentialsProvider.setCredentials(AuthScope.ANY,
                     new UsernamePasswordCredentials(admin, password));
 
-            RestClientBuilder builder = RestClient.builder(
-                    new HttpHost(url, port, "https"))
-                    .setHttpClientConfigCallback(new RestClientBuilder.HttpClientConfigCallback() {
-                        @Override
-                        public HttpAsyncClientBuilder customizeHttpClient(HttpAsyncClientBuilder httpClientBuilder) {
-                            // Configura l'autenticazione HTTP
-                            httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
-                            return httpClientBuilder;
-                        }
-                    });
+            RestClientBuilder[] builder = new RestClientBuilder[hostnames.length];
+            for (int i = 0; i < builder.length; i++) {
+                builder[i] = RestClient.builder(
+                        new HttpHost(hostnames[i], port, "https"))
+                        .setHttpClientConfigCallback(new RestClientBuilder.HttpClientConfigCallback() {
+                            @Override
+                            public HttpAsyncClientBuilder customizeHttpClient(
+                                    HttpAsyncClientBuilder httpClientBuilder) {
+                                // Configura l'autenticazione HTTP
+                                httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
+                                return httpClientBuilder;
+                            }
+                        });
+            }
 
             // invio documenti in elasticsearch
-            sendToIndex(threadNumber, invertedArray, indexName, hostnames, port, admin, password, maxErrors,
-                    errorManager, builder);
+            start = System.currentTimeMillis();
+            int[] metadata = sendToIndex(threadNumber, invertedArray, indexName, hostnames, port, admin, password,
+                    maxErrors,
+                    errorManager, builder, failDir);
+            Logger.log("[TFM] time indexing all documents: " + (System.currentTimeMillis() - start)
+                    + " ms");
+
             Logger.log("[TFM] done");
+
+            return metadata;
 
         } catch (JSONException e) {
             Logger.log("[TFM] Error in sendToEs: " + e);
@@ -173,7 +197,12 @@ public class OpenSearchReconstructionPersistence {
             JSONObject metadata = dinamic.getJSONObject("metadata");
 
             template.put("scenario", metadata.getString("scenarioID"));
-            template.put("dateObserved", metadata.getString("dateTime"));
+
+            // controlla se dateObserved contiene %2B, il percent encoding di +
+
+            String dateObserved = metadata.getString("dateTime");
+
+            template.put("dateObserved", dateObserved);
             template.put("kind", kind);
             JSONArray JD20 = new JSONArray();
 
@@ -617,9 +646,6 @@ public class OpenSearchReconstructionPersistence {
         private String sparqlEndpoint;
         private CloseableHttpClient httpClient;
         private JSONArray allResults;
-        private int index;
-        private static boolean errorFlag = false;
-        private static String errorMessage;
         private ErrorManager errorManager;
 
         public KBThread(int index, String query, String sparqlEndpoint, JSONArray allResults,
@@ -628,7 +654,6 @@ public class OpenSearchReconstructionPersistence {
             this.allResults = allResults;
             this.sparqlEndpoint = sparqlEndpoint;
             this.httpClient = httpClient;
-            this.index = index;
             this.errorManager = errorManager;
         }
 
@@ -753,50 +778,10 @@ public class OpenSearchReconstructionPersistence {
         return totalJsonResp;
     }
 
-    // thread per inserimenti in ES
-    static class ESThread extends Thread {
-        private int index;
-        private JSONArray documents;
-        private String indexName;
-        private String url;
-        private int maxErrors;
-        private ErrorManager errorManager;
-        private RestClientBuilder builder;
-
-        public ESThread(int index, String indexName, JSONArray documents, String url, int maxErrors,
-                ErrorManager errorManager, RestClientBuilder builder) {
-            this.index = index;
-            this.documents = documents;
-            this.indexName = indexName;
-            this.url = url;
-            this.maxErrors = maxErrors;
-            this.errorManager = errorManager;
-            this.builder = builder;
-        }
-
-        @Override
-        public void run() {
-            try {
-
-                boolean status = sendDoc(indexName, documents, url, maxErrors, errorManager,
-                        builder);
-
-                if (!status) {
-                    Logger.log("[TFM] Failed to send data to ES, too many errors indexing data");
-                    throw new Exception("[TFM] Max number of errors exceeded");
-                }
-
-            } catch (Exception e) {
-
-                errorManager.setMustStop();
-                errorManager.writeError(e.getMessage());
-
-            }
-        }
-    }
-
-    private static void sendToIndex(int threadNumber, JSONArray invertedArray, String indexName, String[] url, int port,
-            String admin, String password, int maxErrors, ErrorManager errorManager, RestClientBuilder builder)
+    private static int[] sendToIndex(int threadNumber, JSONArray invertedArray, String indexName, String[] url,
+            int port,
+            String admin, String password, int maxErrors, ErrorManager errorManager, RestClientBuilder[] builder,
+            String failDir)
             throws Exception {
 
         try {
@@ -817,10 +802,13 @@ public class OpenSearchReconstructionPersistence {
             }
 
             List<Thread> threads = new ArrayList<>();
+            List<int[]> metadataList = new ArrayList<>();
+            int[] tmp = { 0, 0, 0 };
+            metadataList.add(tmp);
 
             for (int i = 0; i < numParts; i++) {
                 Thread ESThread = new ESThread(i, indexName, dividedArrays[i], url[i % url.length], maxErrors,
-                        errorManager, builder);
+                        errorManager, builder[i % builder.length], metadataList, failDir);
                 threads.add(ESThread);
                 ESThread.start();
             }
@@ -833,10 +821,15 @@ public class OpenSearchReconstructionPersistence {
                     e.printStackTrace();
                 }
             }
+            Logger.log("[TFM] Results,sent documents: " + metadataList.get(0)[0] + ",partial failures: "
+                    + metadataList.get(0)[1]
+                    + ",total failures: " + metadataList.get(0)[2]);
 
             if (errorManager.getMustStop()) {
                 throw new Exception("[TFM] Failed to send data to ES: " + errorManager.getErrorMessage());
             }
+
+            return metadataList.get(0);
 
         } catch (Exception e) {
             Logger.log("[TFM] Error sending document to ES: " + e);
@@ -845,55 +838,154 @@ public class OpenSearchReconstructionPersistence {
 
     }
 
-    private static boolean sendDoc(String indexName, JSONArray jsonArray, String url, int maxErrors,
-            ErrorManager errorManager, RestClientBuilder builder)
+    // thread per inserimenti in ES
+    static class ESThread extends Thread {
+        private List<int[]> metadataList;
+        private JSONArray documents;
+        private String indexName;
+        private String url;
+        private int maxErrors;
+        private ErrorManager errorManager;
+        private RestClientBuilder builder;
+        private String failDir;
+
+        public ESThread(int index, String indexName, JSONArray documents, String url, int maxErrors,
+                ErrorManager errorManager, RestClientBuilder builder, List<int[]> metadataList, String failDir) {
+            this.metadataList = metadataList;
+            this.documents = documents;
+            this.indexName = indexName;
+            this.url = url;
+            this.maxErrors = maxErrors;
+            this.errorManager = errorManager;
+            this.builder = builder;
+            this.failDir = failDir;
+        }
+
+        @Override
+        public void run() {
+            sendToIndexRes result = null;
+            try {
+
+                result = sendDoc(indexName, documents, url, maxErrors, errorManager,
+                        builder, failDir);
+
+                if (!result.getStatus()) {
+                    Logger.log("[TFM] Max number of errors exceeded");
+
+                    throw new Exception("[TFM] Max number of errors exceeded");
+                }
+
+            } catch (Exception e) {
+
+                errorManager.setMustStop();
+                errorManager.writeError(e.getMessage());
+
+            }
+            synchronized (metadataList) {
+                int[] metadata = metadataList.get(0);
+                metadata[0] = metadata[0] + result.getNSent();
+                metadata[1] = metadata[1] + result.getPartialFailure();
+                metadata[2] = metadata[2] + result.getTotalFailure();
+                metadataList.add(0, metadata);
+            }
+        }
+    }
+
+    // oggetti risultato dei sendToIndex
+    private static class sendToIndexRes {
+        private boolean status; // indica se è stato superato il massimo numero di errori
+        private int partialFailure;
+        private int totalFailure;
+        private int nSent;
+
+        public sendToIndexRes(boolean status, int partialFailure, int totalFailure, int nSent) {
+            this.status = status;
+            this.partialFailure = partialFailure;
+            this.totalFailure = totalFailure;
+            this.nSent = nSent;
+        }
+
+        public boolean getStatus() {
+            return status;
+        }
+
+        public int getPartialFailure() {
+            return partialFailure;
+        }
+
+        public int getTotalFailure() {
+            return totalFailure;
+        }
+
+        public int getNSent() {
+            return nSent;
+        }
+    }
+
+    private static sendToIndexRes sendDoc(String indexName, JSONArray jsonArray, String url, int maxErrors,
+            ErrorManager errorManager, RestClientBuilder builder, String failDir)
             throws Exception {
 
         RestHighLevelClient client = new RestHighLevelClient(builder);
-        // Inizializza il client Elasticsearch
-
         int nSent = 0;
+        int partialFailure = 0;
+        int totalFailure = 0;
 
-        String jsonDocument = "";
-        IndexResponse response = null;
+        Path failureFolderPath = Paths.get(failDir);
 
-        // Invia il documento JSON a Elasticsearch per l'indicizzazione
         for (int i = 0; i < jsonArray.length(); i++) {
-            jsonDocument = jsonArray.getJSONObject(i).toString();
-            try {
-                if (errorManager.getErrorCount() < maxErrors) {
-                    IndexRequest request = new IndexRequest(indexName).source(jsonDocument,
-                            XContentType.JSON);
-                    client.index(request, RequestOptions.DEFAULT);
-                    nSent++;
-                }
-            } catch (Exception e) {
-                Logger.log("[TFM] Error indexing document: " + e);
-                Thread.sleep(500);
-                errorManager.incrementErrorCount();
+            String jsonDocument = jsonArray.getJSONObject(i).toString();
+            boolean documentIndexed = false;
 
-                Logger.log("[TFM] Retrying the current document");
-                // Riprova solo per l'elemento corrente
+            for (int attempt = 0; attempt < 3; attempt++) {
                 try {
-                    IndexRequest retryRequest = new IndexRequest(indexName).source(jsonDocument,
-                            XContentType.JSON);
-                    client.index(retryRequest, RequestOptions.DEFAULT);
-                    nSent++;
+                    if (errorManager.getErrorCount() < maxErrors) {
+                        IndexRequest request = new IndexRequest(indexName).source(jsonDocument, XContentType.JSON);
+                        client.index(request, RequestOptions.DEFAULT);
+                        nSent++;
+                        documentIndexed = true;
+                        break;
+                    }
+                } catch (Exception e) {
+                    partialFailure++;
+                    Logger.log(
+                            "[TFM] Error indexing document, " + Thread.currentThread().getName() + " in hostname " + url
+                                    + " error: " + e);
+                    Thread.sleep(500);
+                    errorManager.incrementErrorCount();
 
-                    Logger.log("[TFM] New indexing attempt successful");
-                } catch (Exception ex) {
-                    Logger.log("[TFM] Error twice indexing the document, the document has not been indexed: " + ex);
+                    Logger.log("[TFM] Retrying the current document (Attempt " + (attempt + 1) + ")");
+                }
+            }
+
+            if (!documentIndexed) {
+                try {
+                    totalFailure++;
+                    Logger.log("[TFM] Error multiple times indexing the document, the document has not been indexed. "
+                            + Thread.currentThread().getName() + " in hostname " + url);
+                    JSONObject failDocument = new JSONObject(jsonDocument);
+                    // Salva il documento non indicizzato nel file di fallimenti
+                    Path failureFilePath = failureFolderPath.resolve(failDocument.getString("scenario"));
+
+                    // Aggiungi il carattere di nuova linea alla fine di ogni documento
+                    String documentWithNewLine = jsonDocument + "\n";
+
+                    Files.write(failureFilePath, documentWithNewLine.getBytes(), StandardOpenOption.CREATE,
+                            StandardOpenOption.APPEND);
+                } catch (Exception e) {
+                    Logger.log("[TFM] Error creating the log file for failed document: " + e);
                 }
             }
         }
+
         client.close();
         Logger.log("[TFM] " + Thread.currentThread().getName() + " sent:" + nSent + " hostname:" + url);
-        if (errorManager.getErrorCount() < maxErrors) {
-            return true;
-        } else {
-            return false;
-        }
 
+        if (errorManager.getErrorCount() < maxErrors) {
+            return new sendToIndexRes(true, partialFailure, totalFailure, nSent);
+        } else {
+            return new sendToIndexRes(false, partialFailure, totalFailure, nSent);
+        }
     }
 
     // #################################### INDEX CREATION

@@ -101,11 +101,12 @@ public class UploadLayerServlet extends HttpServlet {
                     String uploadedLayerName = handleReconstruction(body);
                     JSONObject jbody = new JSONObject(body.toString());
                     if (conf.getProperty("saveToES", "onrequest").equals("always") || jbody.has("saveToES")) {
-                        OpenSearchReconstructionPersistence.sendToEs(jbody, "reconstructed");
+                        int[] metadata = OpenSearchReconstructionPersistence.sendToEs(jbody, "reconstructed");
+                        resp.getWriter().print(buildResponse(true, "layerName", uploadedLayerName, metadata));
                     } else {
                         System.out.println("SKIP save on elastic search");
+                        resp.getWriter().print(buildResponse(true, "layerName", uploadedLayerName));
                     }
-                    resp.getWriter().print(buildResponse(true, "layerName", uploadedLayerName));
                     break;
                 case TTT:
                     // do somethig
@@ -140,6 +141,18 @@ public class UploadLayerServlet extends HttpServlet {
         return builder.build().toString();
     }
 
+    // overloaded method to print metadata from Elastic Search insert
+    private String buildResponse(Boolean success, String name, String value, int[] metadata) {
+        JsonObjectBuilder builder = Json.createObjectBuilder().add("success", success);
+        if (!name.isEmpty() && !value.isEmpty()) {
+            builder.add(name, value);
+        }
+        builder.add("Details",
+                "sent: " + String.valueOf(metadata[0]) + ", failed: " + String.valueOf(metadata[2]));
+
+        return builder.build().toString();
+    }
+
     private void handleStaticGraph(JsonValue json) throws IOException {
 
         Logger.log("[Servlet] Handling static graph upload");
@@ -171,7 +184,11 @@ public class UploadLayerServlet extends HttpServlet {
         String locality = metadata.getString("locality");
         String scenarioID = metadata.getString("scenarioID");
         String dateTime = metadata.getString("dateTime");
+        if (dateTime.contains("+")) {
+            dateTime = dateTime.split("\\+")[0];
+        }
         dateTime = dateTime.replace(':', '-'); // colon causes problems when uploading to GeoServer
+
         String layerName = locality + "_" + scenarioID + "_" + dateTime;
 
         // Convert to SHP and upload to GeoServer
