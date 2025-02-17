@@ -32,7 +32,7 @@ TrafficFlowManager (`TFM`) è il modulo che gestisce l'inserimento dei dati di t
 ```json
 {
   "dateObserved": "2023-09-28T13:00:00",
-  "scenario": "cinuqe",
+  "scenario": "cinque",
   "roadElements": "OS00491331618RE/1",
   "kind": "reconstructed",
   "line": {
