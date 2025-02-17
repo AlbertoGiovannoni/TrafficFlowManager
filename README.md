@@ -30,12 +30,12 @@ IndexName=<nome_indice_es>
 ```
 
 ## Struttura del flusso di elaborazione
-1) Pre-processamento: Formattazione del JSON in un array di documenti con indice basato sul segmento stradale
+1) Pre-processing: Formattazione del JSON in un array di documenti con indice basato sul segmento stradale
 2) Frammentazione: Creazione di documenti separati per ogni elemento stradale
 3) Calcolo della densità: Aggregazione e calcolo della densità media per elemento stradale
-4) Costruzione dell'indice invertito: Associazione di ogni elemento stradale ai segmenti di appartenenza
+4) Costruzione dell'indice inverso: Associazione di ogni elemento stradale ai segmenti di appartenenza
 5) Recupero coordinate geografiche: Interrogazione della knowledge base per ottenere le coordinate di ogni elemento
-6) Post-processamento: Inserimento delle coordinate recuperate nei documenti
+6) Post-processing: Inserimento delle coordinate recuperate nei documenti
 7) Inserimento in Elasticsearch: Invio dei documenti finali a Elasticsearch utilizzando thread multipli
 
 ## Aggiunta di nuovi parametri ai documenti
